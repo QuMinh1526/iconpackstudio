@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TouchLab</string>
+    <string name="notif_channel">TouchLab overlay</string>
+    <string name="notif_title">TouchLab đang chạy</string>
+    <string name="notif_text">Overlay macro &amp; engine cảm ứng</string>
+</resources>
