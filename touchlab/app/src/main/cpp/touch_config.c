@@ -83,9 +83,15 @@ int tc_load(const char *path, tc_config *out, char *err, size_t errlen) {
     out->sensi_x = clampf(out->sensi_x, 1.0f, 3.45f);
     out->sensi_y = clampf(out->sensi_y, 1.0f, 3.45f);
 
-    /* (2) screenW screenH macroCount */
-    if (!next_line(f, line, sizeof(line)) ||
-        sscanf(line, "%d %d %d", &out->screen_w, &out->screen_h, &out->macro_count) != 3) {
+    /* (2) screenW screenH macroCount [formatVersion] */
+    int format_version = 1;
+    if (!next_line(f, line, sizeof(line))) {
+        snprintf(err, errlen, "dòng 2 (kích thước màn hình) sai format");
+        goto fail;
+    }
+    int header_fields = sscanf(line, "%d %d %d %d", &out->screen_w, &out->screen_h,
+                               &out->macro_count, &format_version);
+    if (header_fields < 3) {
         snprintf(err, errlen, "dòng 2 (kích thước màn hình) sai format");
         goto fail;
     }
@@ -93,25 +99,52 @@ int tc_load(const char *path, tc_config *out, char *err, size_t errlen) {
     out->screen_h = clampi(out->screen_h, 1, 20000);
     out->macro_count = clampi(out->macro_count, 0, TC_MAX_MACROS);
 
-    /* (3) macro lines */
+    /* (3) trigger lines và target click */
     for (int i = 0; i < out->macro_count; i++) {
         if (!next_line(f, line, sizeof(line))) {
-            snprintf(err, errlen, "thiếu dòng macro thứ %d", i + 1);
+            snprintf(err, errlen, "thiếu dòng trigger thứ %d", i + 1);
             goto fail;
         }
         tc_macro *m = &out->macros[i];
-        if (sscanf(line, "%f %f %f %f %f %d %d %d", &m->x1, &m->y1, &m->r, &m->x2, &m->y2,
-                   &m->mode, &m->p0, &m->p1) != 8) {
-            snprintf(err, errlen, "dòng macro %d sai format: '%s'", i + 1, line);
-            goto fail;
+        if (format_version >= 2) {
+            if (sscanf(line, "%f %f %f %d %d %d %d %d",
+                       &m->x, &m->y, &m->trigger_r, &m->mode, &m->hold_delay_ms,
+                       &m->press_ms, &m->click_delay_ms, &m->target_count) != 8) {
+                snprintf(err, errlen, "dòng trigger %d sai format: '%s'", i + 1, line);
+                goto fail;
+            }
+            m->mode = clampi(m->mode, 0, 1);
+            m->hold_delay_ms = clampi(m->hold_delay_ms, 0, 100);
+            m->press_ms = clampi(m->press_ms, 1, 50);
+            m->click_delay_ms = clampi(m->click_delay_ms, 0, 50);
+            m->target_count = clampi(m->target_count, 1, TC_MAX_TARGETS);
+            for (int j = 0; j < m->target_count; j++) {
+                if (!next_line(f, line, sizeof(line)) ||
+                    sscanf(line, "%f %f %f", &m->targets[j].x, &m->targets[j].y,
+                           &m->targets[j].r) != 3) {
+                    snprintf(err, errlen, "target %d của trigger %d sai format", j + 1, i + 1);
+                    goto fail;
+                }
+                if (m->targets[j].r < 2.0f) m->targets[j].r = 2.0f;
+            }
+        } else {
+            float old_x2, old_y2;
+            int old_mode, p0, p1;
+            if (sscanf(line, "%f %f %f %f %f %d %d %d",
+                       &m->x, &m->y, &m->trigger_r, &old_x2, &old_y2,
+                       &old_mode, &p0, &p1) != 8) {
+                snprintf(err, errlen, "dòng macro %d sai format: '%s'", i + 1, line);
+                goto fail;
+            }
+            m->mode = old_mode == 3 ? 1 : 0;
+            m->hold_delay_ms = 10;
+            m->press_ms = p0 > 0 ? clampi(p0, 1, 50) : 10;
+            m->click_delay_ms = 0;
+            m->target_count = 1;
+            m->targets[0] = (tc_target) {old_x2, old_y2, 12.0f};
         }
-        m->mode = clampi(m->mode, 0, 3);
-        if (m->p0 > 0) {
-            m->p0 = clampi(m->p0, 10, 5000);   /* sàn 10 ms như engine gốc */
-        }
-        m->p1 = clampi(m->p1, 0, 5000);
-        if (m->r < 4.0f) {
-            m->r = 4.0f;
+        if (m->trigger_r < 4.0f) {
+            m->trigger_r = 4.0f;
         }
     }
 
@@ -163,6 +196,11 @@ int tc_load(const char *path, tc_config *out, char *err, size_t errlen) {
             if (sscanf(line, "F %f %f %f", &out->cross_x, &out->cross_y, &out->cross_r) == 3) {
                 out->has_cross = 1;
             }
+        } else if (line[0] == 'S' && (line[1] == ' ' || line[1] == '\0')) {
+            if (sscanf(line, "S %f %f %f", &out->circle_x, &out->circle_y,
+                       &out->circle_r) == 3 && out->circle_r > 0.0f) {
+                out->has_circle = 1;
+            }
         } else if (line[0] == 'P' && (line[1] == ' ' || line[1] == '\0')) {
             snprintf(out->permit, sizeof(out->permit), "%s", line + 1);
         }
@@ -182,8 +220,13 @@ void tc_dump(const tc_config *cfg, FILE *out) {
     fprintf(out, "screen     : %dx%d\n", cfg->screen_w, cfg->screen_h);
     for (int i = 0; i < cfg->macro_count; i++) {
         const tc_macro *m = &cfg->macros[i];
-        fprintf(out, "macro[%d]   : (%.1f,%.1f) r=%.1f  trigger=(%.1f,%.1f) mode=%d p0=%d p1=%d\n",
-                i, m->x1, m->y1, m->r, m->x2, m->y2, m->mode, m->p0, m->p1);
+        fprintf(out, "trigger[%d] : (%.1f,%.1f) r=%.1f mode=%d targets=%d delay=%d press=%d\n",
+                i, m->x, m->y, m->trigger_r, m->mode, m->target_count,
+                m->hold_delay_ms, m->press_ms);
+        for (int j = 0; j < m->target_count; j++) {
+            const tc_target *t = &m->targets[j];
+            fprintf(out, "  target[%d] : (%.1f,%.1f) r=%.1f\n", j, t->x, t->y, t->r);
+        }
     }
     for (int i = 0; i < cfg->drag_count; i++) {
         const tc_drag *d = &cfg->drags[i];
@@ -193,6 +236,10 @@ void tc_dump(const tc_config *cfg, FILE *out) {
     if (cfg->has_rect) {
         fprintf(out, "zone rect  : (%.1f,%.1f)-(%.1f,%.1f)\n", cfg->rect_x1, cfg->rect_y1,
                 cfg->rect_x2, cfg->rect_y2);
+    }
+    if (cfg->has_circle) {
+        fprintf(out, "zone circle: (%.1f,%.1f) r=%.1f\n",
+                cfg->circle_x, cfg->circle_y, cfg->circle_r);
     }
     if (cfg->has_cross) {
         fprintf(out, "crosshair  : (%.1f,%.1f) r=%.1f\n", cfg->cross_x, cfg->cross_y, cfg->cross_r);

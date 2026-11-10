@@ -2,14 +2,14 @@ package dev.touchlab.config
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.graphics.RectF
+import android.os.Handler
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.WindowManager
 import dev.touchlab.engine.EngineController
 import dev.touchlab.model.AppState
 import dev.touchlab.model.DragKind
-import dev.touchlab.model.MacroMode
-import dev.touchlab.model.ZonePreset
+import dev.touchlab.model.MacroModel
 import org.json.JSONObject
 import java.util.Locale
 
@@ -25,6 +25,15 @@ class TouchConfigManager(context: Context) {
     private val appContext = context.applicationContext
     private val prefs: SharedPreferences =
         appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private val main = Handler(Looper.getMainLooper())
+    private var notifyAfterSave = false
+    private var savePending = false
+    private val pendingSave = Runnable {
+        savePending = false
+        prefs.edit().putString(KEY_STATE, state.toJson().toString()).apply()
+        if (notifyAfterSave) notifyListeners()
+        notifyAfterSave = false
+    }
 
     /** Trạng thái hiện tại. Mọi thay đổi phải gọi [save] để ghi lại. */
     var state: AppState = load()
@@ -47,6 +56,7 @@ class TouchConfigManager(context: Context) {
 
     /** Đọc lại từ SharedPreferences (dùng khi activity sửa xong rồi overlay cần cập nhật). */
     fun reload(): AppState {
+        flushPendingSave()
         state = load()
         notifyListeners()
         return state
@@ -66,11 +76,21 @@ class TouchConfigManager(context: Context) {
         val (w, h) = screenSize()
         val s = AppState()
         s.macros.add(
-            dev.touchlab.model.MacroModel(x = w * 0.75f, y = h * 0.78f, x2 = w * 0.75f, y2 = h * 0.70f)
+            dev.touchlab.model.MacroModel(
+                x = w * 0.75f,
+                y = h * 0.78f,
+                targets = mutableListOf(dev.touchlab.model.MacroTarget(x = w * 0.75f, y = h * 0.70f)),
+            )
         )
         s.macros.add(
-            dev.touchlab.model.MacroModel(x = w * 0.85f, y = h * 0.62f, x2 = w * 0.85f, y2 = h * 0.54f)
+            dev.touchlab.model.MacroModel(
+                x = w * 0.85f,
+                y = h * 0.62f,
+                targets = mutableListOf(dev.touchlab.model.MacroTarget(x = w * 0.85f, y = h * 0.54f)),
+            )
         )
+        s.sensi.circleX = w / 2f
+        s.sensi.circleY = h / 2f
         s.drags = mutableListOf(
             dev.touchlab.model.DragModel(DragKind.DRAG, x = w * 0.3f, y = h * 0.5f, size = 120),
             dev.touchlab.model.DragModel(DragKind.STABLE, x = w * 0.3f, y = h * 0.4f, size = 120),
@@ -80,9 +100,26 @@ class TouchConfigManager(context: Context) {
 
     /** Ghi trạng thái xuống đĩa. */
     fun save(state: AppState = this.state) {
+        main.removeCallbacks(pendingSave)
+        savePending = false
+        notifyAfterSave = false
         this.state = state
         prefs.edit().putString(KEY_STATE, state.toJson().toString()).apply()
         notifyListeners()
+    }
+
+    /** Coalesce high-frequency slider/drag updates into one disk write and notification. */
+    fun saveDebounced(notifyListeners: Boolean = true) {
+        notifyAfterSave = notifyAfterSave || notifyListeners
+        main.removeCallbacks(pendingSave)
+        savePending = true
+        main.postDelayed(pendingSave, SAVE_DEBOUNCE_MS)
+    }
+
+    fun flushPendingSave() {
+        if (!savePending) return
+        main.removeCallbacks(pendingSave)
+        pendingSave.run()
     }
 
     private fun notifyListeners() {
@@ -113,7 +150,7 @@ class TouchConfigManager(context: Context) {
      * Sinh nội dung file config.
      *
      * Format giống Zayon (cùng thứ tự dòng, cùng định dạng số) nhưng hệ số sensi là hệ số
-     * GỐC (1.0–3.45). Các dòng phụ `Z` (custom zone) và `F` (crosshair) là phần mở rộng.
+     * GỐC (1.0–3.45). Dòng phụ `S` lưu tâm/bán kính vùng tròn Sensi.
      */
     fun buildConfigText(state: AppState = this.state): String {
         val (w, h) = screenSize()
@@ -130,19 +167,30 @@ class TouchConfigManager(context: Context) {
         )
 
         val macros = state.macros.take(MAX_MACROS)
-        // ② screenW screenH macroCount
-        sb.append("$w $h ${macros.size}\n")
+        // ② screenW screenH macroCount formatVersion
+        sb.append("$w $h ${macros.size} 2\n")
 
-        // ③ mỗi macro: x1 y1 r x2 y2 mode p0 p1
+        // ③ trigger: x y diameter mode holdDelay pressMs clickDelay targetCount
         macros.forEach { m ->
-            val mode = m.mode.coerceIn(0, 3)
+            val targets = m.targets.take(MacroModel.MAX_TARGETS).ifEmpty {
+                listOf(dev.touchlab.model.MacroTarget(x = m.x, y = m.y))
+            }
+            val mode = m.mode.coerceIn(0, 1)
             sb.append(
                 String.format(
-                    Locale.US, "%.1f %.1f %.1f %.1f %.1f %d %d %d\n",
-                    m.x, m.y, m.size / 2f, m.x2, m.y2, mode,
-                    MacroMode.P0[mode], MacroMode.P1[mode]
+                    Locale.US, "%.1f %.1f %.1f %d %d %d %d %d\n",
+                    m.x, m.y, m.sizeDp * density(), mode, m.holdDelayMs, m.pressDurationMs,
+                    m.clickDelayMs, targets.size
                 )
             )
+            targets.forEach { target ->
+                sb.append(
+                    String.format(
+                        Locale.US, "%.1f %.1f %.1f\n",
+                        target.x, target.y, target.sizeDp * density(),
+                    )
+                )
+            }
         }
 
         val drags = state.drags.take(MAX_DRAGS)
@@ -158,28 +206,12 @@ class TouchConfigManager(context: Context) {
             )
         }
 
-        // ⑥ custom zone (chỉ khi zone = CUSTOM) — phần mở rộng so với Zayon
-        val rect = customRectFor(state)
-        if (rect != null) {
-            sb.append(
-                String.format(
-                    Locale.US, "Z %.0f %.0f %.0f %.0f\n",
-                    rect.left, rect.top, rect.right, rect.bottom
-                )
-            )
-        }
+        val radiusPx = state.sensi.circleDiameterDp * density() / 2f
+        sb.append(String.format(Locale.US, "S %.1f %.1f %.1f\n", sensi.circleX, sensi.circleY, radiusPx))
         return sb.toString()
     }
 
-    private fun customRectFor(state: AppState): RectF? {
-        val (w, h) = screenSize()
-        return when {
-            state.sensi.zone == ZonePreset.CUSTOM -> state.sensi.customRect ?: RectF(0f, 0f, w.toFloat(), h.toFloat())
-            state.macros.any { it.zone == ZonePreset.CUSTOM && it.customRect != null } ->
-                state.macros.first { it.zone == ZonePreset.CUSTOM && it.customRect != null }.customRect
-            else -> null
-        }
-    }
+    private fun density(): Float = appContext.resources.displayMetrics.density
 
     /** Đẩy config xuống engine. Trả về lỗi (nếu có) để UI hiển thị. */
     fun pushToEngine(notifyEngine: Boolean = true): Result<Unit> {
@@ -192,6 +224,7 @@ class TouchConfigManager(context: Context) {
     companion object {
         private const val PREFS = "touchlab_config"
         private const val KEY_STATE = "state"
+        private const val SAVE_DEBOUNCE_MS = 140L
 
         /** Giới hạn giống engine/permit của bản gốc. */
         const val MAX_MACROS = 8

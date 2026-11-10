@@ -61,8 +61,8 @@ app/src/main/java/dev/touchlab/
 3. Engine mở `/dev/uinput`, tạo thiết bị touch ảo, rồi theo dõi file `cmd` bằng **inotify**.
    App ghi mỗi lệnh là một dòng vào file đó qua một shell nền sống lâu (không spawn lại shell
    cho từng lệnh — quan trọng với sensitivity 60–120 Hz).
-4. Lệnh hỗ trợ: `TAP x y`, `MACRO idx [hold]`, `HOLD idx`, `RELEASE idx`, `DRAG idx dx dy`,
-   `SENS_BEGIN/MOVE/END`, `RECONFIG`, `PING`, `STOP`.
+4. Lệnh hỗ trợ: `TRIGGER idx` (chạy các target theo thứ tự), `TRIGGER_DOWN/UP idx` (Hold),
+   `DRAG idx dx dy`, `SENS_BEGIN/MOVE/END`, `RECONFIG`, `PING`, `STOP`.
 5. Overlay: mỗi nút macro là một cửa sổ nhỏ (không phải 1 cửa sổ full-screen) nên không chặn
    touch của game ở vùng khác. Panel/editor là cửa sổ full-screen tạm thời.
 
@@ -72,15 +72,17 @@ Giữ đúng thứ tự dòng của Zayon:
 
 ```
 <sensiX> <sensiY> <zone> <accel> 0 <rotation>     ①
-<screenW> <screenH> <macroCount>                  ②
-<x1> <y1> <r> <x2> <y2> <mode> <p0> <p1>         ③ × macroCount
+<screenW> <screenH> <macroCount> 2                ② (format v2)
+<triggerX> <triggerY> <r> <mode> <holdDelay> <pressMs> <clickDelay> <targetCount> ③
+<targetX> <targetY> <r>                          ③a × targetCount
 <dragCount>                                       ④
 <x> <y> <r> <strength> <kind> <delay>             ⑤ × dragCount
-Z <x1> <y1> <x2> <y2>                             ⑥ tuỳ chọn: custom zone (phần mở rộng)
+S <centerX> <centerY> <radius>                    ⑥ tuỳ chọn: vùng tròn Sensi
 ```
 
-`zone`: 0 = toàn màn hình, 1 = nửa trái, 2 = nửa phải, 3 = custom (kèm dòng `Z`).
-`mode` macro: 0 tap nhanh, 1 tap vừa, 2 tap chậm, 3 giữ (bảng `p0/p1` giống bản gốc).
+`zone`: 0 = toàn màn hình, 1 = nửa trái, 2 = nửa phải, 3 = vùng tròn tự chọn.
+`mode` macro: 0 = Click (trễ trước lượt chạy), 1 = Hold (lặp khi giữ, có khoảng nghỉ sau mỗi click).
+Mỗi trigger có tối đa 10 target; target được bấm theo thứ tự lưu trong config.
 
 ## Khác biệt so với bản gốc (có chủ ý)
 
@@ -100,6 +102,5 @@ Z <x1> <y1> <x2> <y2>                             ⑥ tuỳ chọn: custom zone 
   touch đã scale (đây là cách các app dạng này hoạt động).
 - Engine không chạy được nếu kernel/ROM chặn `/dev/uinput` hoặc SELinux hạn chế shell; log
   trong app sẽ ghi rõ lỗi.
-- Chưa có test tự động; phần đã kiểm chứng: engine biên dịch bằng clang (host) và chạy
-  `--dry-run`/`--print` với config mẫu; app build `assembleDebug` thành công (Kotlin + Compose +
-  native arm64). Chưa chạy trên thiết bị thật.
+- Chưa chạy trên thiết bị thật. Sensi cần quyền overlay và `/dev/uinput`; một số ROM có thể
+  giới hạn các quyền này dù Shizuku đã được cấp.

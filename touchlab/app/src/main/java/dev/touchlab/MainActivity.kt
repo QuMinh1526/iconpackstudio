@@ -3,7 +3,7 @@ package dev.touchlab
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.RectF
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,8 +17,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
+
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Box
@@ -37,7 +36,6 @@ import androidx.compose.ui.Modifier
 import dev.touchlab.config.TouchConfigManager
 import dev.touchlab.engine.EngineController
 import dev.touchlab.overlay.OverlayService
-import dev.touchlab.overlay.ZoneEditorContent
 import dev.touchlab.shizuku.ShizukuHelper
 import dev.touchlab.ui.GameLabScreen
 import dev.touchlab.ui.HomeScreen
@@ -45,9 +43,7 @@ import dev.touchlab.ui.MacroScreen
 import dev.touchlab.ui.SensiScreen
 import dev.touchlab.ui.TouchLabTheme
 import rikka.shizuku.Shizuku
-
-/** Vùng đang được vẽ trong editor toàn màn hình. */
-private data class ZoneTarget(val title: String, val current: RectF?, val onSave: (RectF) -> Unit)
+import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
 
@@ -56,7 +52,9 @@ class MainActivity : ComponentActivity() {
     private var shizukuStatus by mutableStateOf(ShizukuHelper.Status.NO_SERVICE)
     private var overlayRunning by mutableStateOf(false)
     private var logText by mutableStateOf("")
-    private var zoneTarget by mutableStateOf<ZoneTarget?>(null)
+    private var screenSize by mutableStateOf(0 to 0)
+    private val io = Executors.newSingleThreadExecutor()
+    private var stateRevision by mutableIntStateOf(0)
 
     private val notifPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* không bắt buộc */ }
@@ -74,6 +72,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         config = TouchConfigManager(this)
+        screenSize = config.screenSize()
         refreshState()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -84,12 +83,13 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             TouchLabTheme {
-                val tick = remember { mutableIntStateOf(0) }
                 App(
                     config = config,
                     shizukuStatus = shizukuStatus,
                     overlayRunning = overlayRunning,
                     logText = logText,
+                    screenW = screenSize.first,
+                    screenH = screenSize.second,
                     onRequestShizuku = {
                         if (!ShizukuHelper.requestPermission()) {
                             toast("Không xin được quyền. Hãy mở app Shizuku và bật dịch vụ trước.")
@@ -102,31 +102,9 @@ class MainActivity : ComponentActivity() {
                         overlayRunning = false
                     },
                     onRefresh = { refreshState() },
-                    onPickZone = { title, current, onSave ->
-                        zoneTarget = ZoneTarget(title, current, onSave)
-                    },
-                    revision = tick.intValue,
-                    bumpRevision = { tick.intValue++ },
+                    revision = stateRevision,
+                    bumpRevision = { stateRevision++ },
                 )
-
-                zoneTarget?.let { target ->
-                    Dialog(
-                        onDismissRequest = { zoneTarget = null },
-                        properties = DialogProperties(usePlatformDefaultWidth = false),
-                    ) {
-                        Box(Modifier.fillMaxSize()) {
-                            ZoneEditorContent(
-                                title = target.title,
-                                initial = target.current,
-                                onCancel = { zoneTarget = null },
-                                onSave = { rect ->
-                                    target.onSave(rect)
-                                    zoneTarget = null
-                                },
-                            )
-                        }
-                    }
-                }
             }
         }
     }
@@ -138,20 +116,43 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         runCatching { Shizuku.removeRequestPermissionResultListener(permissionListener) }
+        config.flushPendingSave()
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        io.shutdownNow()
+        super.onDestroy()
     }
 
     override fun onResume() {
         super.onResume()
         // Quay lại từ màn hình cấp quyền overlay → cập nhật lại trạng thái.
         config.reload()
+        screenSize = config.screenSize()
+        stateRevision++
         refreshState()
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        screenSize = config.screenSize()
+    }
+
     private fun refreshState() {
-        shizukuStatus = ShizukuHelper.status()
+        val status = ShizukuHelper.status()
+        shizukuStatus = status
         overlayRunning = OverlayService.isRunning
-        logText = if (shizukuStatus == ShizukuHelper.Status.READY) EngineController.logTail(40) else ""
+        if (status != ShizukuHelper.Status.READY) {
+            logText = ""
+            return
+        }
+        io.execute {
+            val latestLog = EngineController.logTail(40)
+            runOnUiThread {
+                if (shizukuStatus == ShizukuHelper.Status.READY) logText = latestLog
+            }
+        }
     }
 
     private fun openOverlaySettings() {
@@ -188,22 +189,21 @@ private fun App(
     shizukuStatus: ShizukuHelper.Status,
     overlayRunning: Boolean,
     logText: String,
+    screenW: Int,
+    screenH: Int,
     onRequestShizuku: () -> Unit,
     onOpenOverlaySettings: () -> Unit,
     onStartOverlay: () -> Unit,
     onStopOverlay: () -> Unit,
     onRefresh: () -> Unit,
-    onPickZone: (String, RectF?, (RectF) -> Unit) -> Unit,
     revision: Int,
     bumpRevision: () -> Unit,
 ) {
     var tab by remember { mutableIntStateOf(0) }
     // `revision` là key của remember → đọc nó ở đây để cả cây recompose sau mỗi lần sửa state.
     val state = remember(revision) { config.state }
-    val (screenW, screenH) = remember(revision) { config.screenSize() }
-
     val onEdit: () -> Unit = {
-        config.save()
+        config.saveDebounced()
         bumpRevision()
     }
 
@@ -252,8 +252,8 @@ private fun App(
                     onStopOverlay = onStopOverlay,
                     onRefresh = onRefresh,
                 )
-                1 -> MacroScreen(state, screenW, screenH, onEdit, onPickZone)
-                2 -> SensiScreen(state, onEdit, onPickZone)
+                1 -> MacroScreen(state, screenW, screenH, onEdit)
+                2 -> SensiScreen(state, screenW, screenH, onEdit)
                 else -> GameLabScreen()
             }
         }

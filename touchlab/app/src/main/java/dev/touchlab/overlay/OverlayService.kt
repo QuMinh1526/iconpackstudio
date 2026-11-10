@@ -9,7 +9,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
-import android.graphics.RectF
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -26,8 +25,12 @@ import dev.touchlab.R
 import dev.touchlab.config.TouchConfigManager
 import dev.touchlab.engine.EngineController
 import dev.touchlab.model.AppState
+import dev.touchlab.model.MacroMode
 import dev.touchlab.model.MacroModel
+import dev.touchlab.model.MacroTarget
+import dev.touchlab.model.ZonePreset
 import dev.touchlab.shizuku.ShizukuHelper
+import java.util.concurrent.Executors
 
 /**
  * Foreground service giữ overlay + engine.
@@ -73,6 +76,8 @@ class OverlayService : Service(), TouchConfigManager.Listener {
     private lateinit var wm: WindowManager
     private lateinit var config: TouchConfigManager
     private val main = Handler(Looper.getMainLooper())
+    private val engineExecutor = Executors.newSingleThreadExecutor()
+    private val rebuildAfterEdit = Runnable { rebuildWidgets() }
 
     private var screenW = 1080
     private var screenH = 2400
@@ -80,9 +85,11 @@ class OverlayService : Service(), TouchConfigManager.Listener {
 
     private val widgetWins = mutableListOf<Win>()
     private val macroWins = mutableMapOf<Int, Win>()
+    private val targetWins = mutableMapOf<String, Win>()
     private var panelWin: Win? = null
-    private var editorWin: Win? = null
+    private var sensiCircleWin: Win? = null
     private var menuWin: Win? = null
+    private val activeHolds = mutableSetOf<Int>()
 
     @Volatile private var engineOk = false
     @Volatile private var engineMsg: String? = null
@@ -92,7 +99,7 @@ class OverlayService : Service(), TouchConfigManager.Listener {
     private var pushPending = false
     private var stopping = false
 
-    /** Macro đang được "giữ" (mode 3) — -1 nếu không có. */
+    /** Macro trigger đang được giữ — -1 nếu không có. */
     private var holdIndex = -1
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -115,7 +122,12 @@ class OverlayService : Service(), TouchConfigManager.Listener {
             }
             ACTION_REBUILD -> {
                 startForegroundCompat()
-                config.reload()
+                selfEdit = true
+                try {
+                    config.reload()
+                } finally {
+                    selfEdit = false
+                }
                 rebuildWidgets()
                 return START_STICKY
             }
@@ -128,9 +140,13 @@ class OverlayService : Service(), TouchConfigManager.Listener {
     }
 
     override fun onDestroy() {
+        if (!stopping) {
+            stopping = true
+            engineExecutor.execute { EngineController.stop() }
+            engineExecutor.shutdown()
+        }
         removeAllWindows()
         config.removeListener(this)
-        EngineController.stop()
         isRunning = false
         super.onDestroy()
     }
@@ -155,24 +171,33 @@ class OverlayService : Service(), TouchConfigManager.Listener {
             ShizukuHelper.Status.READY -> Unit
         }
 
-        config.reload()
-        // Ghi config trước khi start để engine có file hợp lệ ngay từ đầu.
-        config.pushToEngine(notifyEngine = false)
-
-        EngineController.clearLog()
-        EngineController.start(this)
-            .onSuccess {
-                engineOk = true
-                engineMsg = null
-            }
-            .onFailure {
-                engineOk = false
-                engineMsg = it.message
-                toast("Engine lỗi: ${it.message}")
-            }
-
+        selfEdit = true
+        try {
+            config.reload()
+        } finally {
+            selfEdit = false
+        }
+        val configText = config.buildConfigText()
+        engineOk = false
+        engineMsg = null
         isRunning = true
         rebuildWidgets()
+
+        engineExecutor.execute {
+            val result = runCatching {
+                EngineController.clearLog()
+                EngineController.pushConfig(this, configText).getOrThrow()
+                EngineController.start(this).getOrThrow()
+            }
+            main.post {
+                if (stopping) return@post
+                engineOk = result.isSuccess
+                engineMsg = result.exceptionOrNull()?.message
+                if (engineMsg != null) {
+                    toast("Engine lỗi: $engineMsg")
+                }
+            }
+        }
     }
 
     /**
@@ -191,7 +216,8 @@ class OverlayService : Service(), TouchConfigManager.Listener {
         stopping = true
         main.removeCallbacksAndMessages(null)
         removeAllWindows()
-        EngineController.stop()
+        engineExecutor.execute { EngineController.stop() }
+        engineExecutor.shutdown()
         config.removeListener(this)
         OverlayService.isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -236,11 +262,13 @@ class OverlayService : Service(), TouchConfigManager.Listener {
     }
 
     private fun removeAllWindows() {
-        hideEditor()
         hidePanel()
+        releaseHolds()
         widgetWins.toList().forEach { removeWin(it) }
         widgetWins.clear()
         macroWins.clear()
+        targetWins.clear()
+        sensiCircleWin = null
         menuWin = null
     }
 
@@ -254,13 +282,19 @@ class OverlayService : Service(), TouchConfigManager.Listener {
     private fun rebuildWidgets() {
         if (stopping) return
         readScreenSize()
+        releaseHolds()
         widgetWins.toList().forEach { removeWin(it) }
         widgetWins.clear()
         macroWins.clear()
+        targetWins.clear()
+        sensiCircleWin = null
         menuWin = null
 
         val state = config.state
-        if (state.sensi.enabled) addSensiLayer()
+        if (state.sensi.enabled) {
+            addSensiLayer()
+            if (state.sensi.zone == ZonePreset.CIRCLE) addSensiCircle(state.sensi)
+        }
         addMacroButtons(state)
         addMenuButton()
     }
@@ -268,9 +302,9 @@ class OverlayService : Service(), TouchConfigManager.Listener {
     private fun addSensiLayer() {
         val view = OverlayComposeView(this) {
             SensiTouchLayer(
-                onBegin = { x, y -> EngineController.send("SENS_BEGIN $x $y") },
-                onMove = { x, y -> EngineController.sendFast("SENS_MOVE $x $y") },
-                onEnd = { EngineController.send("SENS_END") },
+                onBegin = { x, y -> sendEngineCommand("SENS_BEGIN $x $y") },
+                onMove = { x, y -> sendEngineCommand("SENS_MOVE $x $y") },
+                onEnd = { sendEngineCommand("SENS_END") },
             )
         }
         addWindow(
@@ -287,28 +321,65 @@ class OverlayService : Service(), TouchConfigManager.Listener {
         )
     }
 
+    private fun addSensiCircle(sensi: dev.touchlab.model.SensiModel) {
+        val diameter = dp(sensi.circleDiameterDp.toFloat())
+        val p = params(
+            diameter,
+            diameter,
+            (sensi.circleX - diameter / 2f).toInt(),
+            (sensi.circleY - diameter / 2f).toInt(),
+            baseFlags or if (sensi.circleLocked) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0,
+        )
+        val view = OverlayComposeView(this) {
+            SensiCircleContent(
+                diameter = diameter,
+                alpha = sensi.circleAlpha,
+                locked = sensi.circleLocked,
+                onDrag = { dx, dy ->
+                    sensi.circleX = (sensi.circleX + dx).coerceIn(0f, screenW.toFloat())
+                    sensi.circleY = (sensi.circleY + dy).coerceIn(0f, screenH.toFloat())
+                    sensiCircleWin?.let { win ->
+                        win.params.x = (sensi.circleX - diameter / 2f).toInt()
+                        win.params.y = (sensi.circleY - diameter / 2f).toInt()
+                        runCatching { wm.updateViewLayout(win.view, win.params) }
+                    }
+                },
+                onDragEnd = { editAndSave() },
+            )
+        }
+        sensiCircleWin = addWindow(view, p, widget = true)
+    }
+
     private fun addMacroButtons(state: AppState) {
         state.macros.take(TouchConfigManager.MAX_MACROS).forEachIndexed { index, macro ->
             if (!macro.enabled) return@forEachIndexed
-            val sizePx = macro.size.coerceIn(TouchConfigManager.SIZE_MIN, TouchConfigManager.SIZE_MAX)
 
+            macro.targets.take(MacroModel.MAX_TARGETS).forEachIndexed { targetIndex, target ->
+                addMacroTarget(targetIndex, target)
+            }
+            val sizePx = dp(macro.sizeDp.toFloat())
             val view = OverlayComposeView(this) {
                 MacroButtonContent(
                     index = index,
                     size = sizePx,
                     mode = macro.mode,
+                    locked = macro.triggerLocked,
                     holdActive = holdIndex == index,
-                    onTap = {
-                        // mode 3 = giữ: chạm lần đầu HOLD, chạm lần nữa RELEASE.
-                        if (macro.mode == 3) {
-                            val hold = holdIndex != index
-                            holdIndex = if (hold) index else -1
-                            EngineController.send(if (hold) "HOLD $index" else "RELEASE $index")
-                            rebuildWidgets()
-                        } else {
-                            EngineController.send("MACRO $index")
+                    onPress = {
+                        if (macro.mode == MacroMode.HOLD) {
+                            holdIndex = index
+                            activeHolds.add(index)
+                            sendEngineCommand("TRIGGER_DOWN $index")
                         }
                     },
+                    onRelease = {
+                        if (macro.mode == MacroMode.HOLD) {
+                            if (holdIndex == index) holdIndex = -1
+                            activeHolds.remove(index)
+                            sendEngineCommand("TRIGGER_UP $index")
+                        }
+                    },
+                    onTap = { sendEngineCommand("TRIGGER $index") },
                     onDrag = { dx, dy ->
                         macroWins[index]?.let { w ->
                             w.params.x += dx.toInt()
@@ -317,12 +388,14 @@ class OverlayService : Service(), TouchConfigManager.Listener {
                         }
                     },
                     onDragEnd = {
-                        // Đồng bộ toạ độ model từ vị trí cửa sổ sau khi kéo.
                         macroWins[index]?.let { w ->
-                            macro.x = w.params.x + w.params.width / 2f
-                            macro.y = w.params.y + w.params.height / 2f
+                            val half = w.params.width / 2f
+                            macro.x = (w.params.x + half).coerceIn(half, screenW - half)
+                            macro.y = (w.params.y + half).coerceIn(half, screenH - half)
+                            w.params.x = (macro.x - half).toInt()
+                            w.params.y = (macro.y - half).toInt()
+                            runCatching { wm.updateViewLayout(w.view, w.params) }
                         }
-                        clampToScreen(macro, index)
                         editAndSave()
                     },
                 )
@@ -336,15 +409,33 @@ class OverlayService : Service(), TouchConfigManager.Listener {
         }
     }
 
-    private fun clampToScreen(m: MacroModel, index: Int) {
-        val half = m.size / 2f
-        m.x = m.x.coerceIn(half, screenW - half)
-        m.y = m.y.coerceIn(half, screenH - half)
-        macroWins[index]?.let { w ->
-            w.params.x = (m.x - w.params.width / 2f).toInt()
-            w.params.y = (m.y - w.params.height / 2f).toInt()
-            runCatching { wm.updateViewLayout(w.view, w.params) }
+    private fun addMacroTarget(targetIndex: Int, target: MacroTarget) {
+        val diameter = dp(target.sizeDp.toFloat())
+        val p = params(
+            diameter,
+            diameter,
+            (target.x - diameter / 2f).toInt(),
+            (target.y - diameter / 2f).toInt(),
+            baseFlags or if (target.locked) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0,
+        )
+        val view = OverlayComposeView(this) {
+            MacroTargetContent(
+                index = targetIndex,
+                size = diameter,
+                locked = target.locked,
+                onDrag = { dx, dy ->
+                    target.x = (target.x + dx).coerceIn(0f, screenW.toFloat())
+                    target.y = (target.y + dy).coerceIn(0f, screenH.toFloat())
+                    targetWins[target.id]?.let { win ->
+                        win.params.x = (target.x - diameter / 2f).toInt()
+                        win.params.y = (target.y - diameter / 2f).toInt()
+                        runCatching { wm.updateViewLayout(win.view, win.params) }
+                    }
+                },
+                onDragEnd = { editAndSave() },
+            )
         }
+        addWindow(view, p, widget = true)?.let { targetWins[target.id] = it }
     }
 
     private fun addMenuButton() {
@@ -372,11 +463,12 @@ class OverlayService : Service(), TouchConfigManager.Listener {
         val view = OverlayComposeView(this) {
             OverlayPanelContent(
                 state = config.state,
+                screenW = screenW,
+                screenH = screenH,
                 engineOk = engineOk,
                 engineMessage = engineMsg,
                 onEdit = { editAndSave() },
                 onApply = { applyNow() },
-                onPickZone = { title, current, onSave -> showEditor(title, current, onSave) },
                 onAddMacro = { addMacro() },
                 onRemoveMacro = { removeMacro(it) },
                 onRestartEngine = { restartEngine() },
@@ -402,44 +494,13 @@ class OverlayService : Service(), TouchConfigManager.Listener {
         panelWin = null
     }
 
-    private fun showEditor(title: String, current: RectF?, onSave: (RectF) -> Unit) {
-        hideEditor()
-        val view = OverlayComposeView(this) {
-            ZoneEditorContent(
-                title = title,
-                initial = current,
-                onCancel = { hideEditor() },
-                onSave = { r ->
-                    onSave(r)
-                    hideEditor()
-                },
-            )
-        }
-        editorWin = addWindow(
-            view,
-            params(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                0, 0,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            ),
-            widget = false,
-        )
-    }
-
-    private fun hideEditor() {
-        removeWin(editorWin)
-        editorWin = null
-    }
-
     // ---------------------------------------------------------------- hành động
 
     /** Lưu thay đổi do overlay tạo ra (không nghe lại listener của chính mình). */
     private fun editAndSave() {
-        selfEdit = true
-        config.save()
-        selfEdit = false
+        config.saveDebounced(notifyListeners = false)
+        main.removeCallbacks(rebuildAfterEdit)
+        main.postDelayed(rebuildAfterEdit, 180)
         schedulePush()
     }
 
@@ -453,12 +514,12 @@ class OverlayService : Service(), TouchConfigManager.Listener {
             MacroModel(
                 x = screenW * 0.7f,
                 y = screenH * 0.5f,
-                x2 = screenW * 0.7f,
-                y2 = screenH * 0.42f,
+                targets = mutableListOf(
+                    MacroTarget(x = screenW * 0.7f, y = screenH * 0.42f)
+                ),
             )
         )
         editAndSave()
-        rebuildWidgets()
     }
 
     private fun removeMacro(index: Int) {
@@ -466,34 +527,47 @@ class OverlayService : Service(), TouchConfigManager.Listener {
         if (index !in state.macros.indices) return
         state.macros.removeAt(index)
         editAndSave()
-        rebuildWidgets()
     }
 
     private fun restartEngine() {
-        EngineController.stop()
         engineOk = false
-        config.pushToEngine(notifyEngine = false)
-        EngineController.start(this)
-            .onSuccess {
-                engineOk = true
-                engineMsg = null
-                toast("Engine đã chạy")
+        val configText = config.buildConfigText()
+        engineExecutor.execute {
+            val result = runCatching {
+                EngineController.stop()
+                EngineController.pushConfig(this, configText).getOrThrow()
+                EngineController.start(this).getOrThrow()
             }
-            .onFailure {
-                engineOk = false
-                engineMsg = it.message
-                toast("Engine lỗi: ${it.message}")
+            main.post {
+                if (stopping) return@post
+                engineOk = result.isSuccess
+                engineMsg = result.exceptionOrNull()?.message
+                if (engineOk) {
+                    toast("Engine đã chạy")
+                } else {
+                    toast("Engine lỗi: ${engineMsg}")
+                }
+                hidePanel()
+                showPanel()
             }
-        // Vẽ lại panel để cập nhật trạng thái engine.
-        hidePanel()
-        showPanel()
+        }
     }
 
     private fun applyNow() {
-        config.save()
-        config.pushToEngine()
+        selfEdit = true
+        try {
+            config.save()
+        } finally {
+            selfEdit = false
+        }
         rebuildWidgets()
-        toast(if (engineOk) "Đã áp dụng cấu hình" else "Đã lưu cấu hình (engine chưa chạy)")
+        if (!engineOk) {
+            toast("Đã lưu cấu hình (engine chưa chạy)")
+            return
+        }
+        pushConfigAsync(notifyEngine = true) { result ->
+            toast(if (result.isSuccess) "Đã áp dụng cấu hình" else "Lỗi áp dụng: ${result.exceptionOrNull()?.message}")
+        }
     }
 
     /** Gộp các thay đổi liên tiếp (kéo slider) thành một lần đẩy config. */
@@ -502,14 +576,48 @@ class OverlayService : Service(), TouchConfigManager.Listener {
         pushPending = true
         main.postDelayed({
             pushPending = false
-            config.pushToEngine()
+            pushConfigAsync(notifyEngine = true)
         }, 400)
     }
 
     override fun onConfigChanged(state: AppState) {
-        // Thay đổi từ MainActivity (instance config khác) → vẽ lại nút macro.
         if (selfEdit) return
-        main.post { rebuildWidgets() }
+        main.post {
+            if (stopping) return@post
+            selfEdit = true
+            try {
+                config.reload()
+            } finally {
+                selfEdit = false
+            }
+            rebuildWidgets()
+            pushConfigAsync(notifyEngine = true)
+        }
+    }
+
+    private fun pushConfigAsync(notifyEngine: Boolean, onComplete: ((Result<Unit>) -> Unit)? = null) {
+        if (stopping) return
+        val text = config.buildConfigText()
+        engineExecutor.execute {
+            val result = EngineController.pushConfig(this, text).mapCatching {
+                if (notifyEngine && engineOk) EngineController.send("RECONFIG")
+                Unit
+            }
+            if (onComplete != null) {
+                main.post { if (!stopping) onComplete(result) }
+            }
+        }
+    }
+
+    private fun sendEngineCommand(command: String) {
+        if (stopping) return
+        engineExecutor.execute { EngineController.send(command) }
+    }
+
+    private fun releaseHolds() {
+        activeHolds.toList().forEach { sendEngineCommand("TRIGGER_UP $it") }
+        activeHolds.clear()
+        holdIndex = -1
     }
 
     // ---------------------------------------------------------------- tiện ích

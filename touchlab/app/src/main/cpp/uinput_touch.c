@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -19,10 +20,13 @@
 #include <unistd.h>
 
 #define ABS_MAX_VALUE 32767
+#define MAX_TOUCH_SLOTS 10
 
 static int g_screen_w = 1080;
 static int g_screen_h = 2400;
 static int g_tracking_id = 1;
+static int g_slot_active[MAX_TOUCH_SLOTS];
+static pthread_mutex_t g_slots_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Khai báo dải toạ độ cho một trục (kernel >= 4.5). */
 static int setup_abs(int fd, int axis, int min, int max) {
@@ -175,27 +179,76 @@ static int emit_position(int fd, float x, float y) {
     return 0;
 }
 
-int ui_touch_down(int fd, float x, float y) {
-    if (fd < 0) return -1;
-    if (emit(fd, EV_ABS, ABS_MT_SLOT, 0) < 0) return -1;
-    if (emit(fd, EV_ABS, ABS_MT_TRACKING_ID, g_tracking_id++) < 0) return -1;
+static int valid_slot(int slot) {
+    return slot >= 0 && slot < MAX_TOUCH_SLOTS;
+}
+
+static int any_slot_active(void) {
+    for (int i = 0; i < MAX_TOUCH_SLOTS; i++) {
+        if (g_slot_active[i]) return 1;
+    }
+    return 0;
+}
+
+int ui_touch_down_slot(int fd, int slot, float x, float y) {
+    if (fd < 0 || !valid_slot(slot)) return -1;
+    pthread_mutex_lock(&g_slots_mutex);
+    if (emit(fd, EV_ABS, ABS_MT_SLOT, slot) < 0) goto fail;
+    if (emit(fd, EV_ABS, ABS_MT_TRACKING_ID, g_tracking_id++) < 0) goto fail;
     if (g_tracking_id > 65000) g_tracking_id = 1;
-    if (emit_position(fd, x, y) < 0) return -1;
-    if (emit(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 6) < 0) return -1;
-    if (emit(fd, EV_KEY, BTN_TOUCH, 1) < 0) return -1;
-    return emit(fd, EV_SYN, SYN_REPORT, 0);
+    if (emit_position(fd, x, y) < 0) goto fail;
+    if (emit(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 6) < 0) goto fail;
+    g_slot_active[slot] = 1;
+    if (emit(fd, EV_KEY, BTN_TOUCH, 1) < 0) {
+        g_slot_active[slot] = 0;
+        goto fail;
+    }
+    if (emit(fd, EV_SYN, SYN_REPORT, 0) < 0) goto fail;
+    pthread_mutex_unlock(&g_slots_mutex);
+    return 0;
+fail:
+    pthread_mutex_unlock(&g_slots_mutex);
+    return -1;
+}
+
+int ui_touch_move_slot(int fd, int slot, float x, float y) {
+    if (fd < 0 || !valid_slot(slot)) return -1;
+    pthread_mutex_lock(&g_slots_mutex);
+    int rc = g_slot_active[slot] ? emit(fd, EV_ABS, ABS_MT_SLOT, slot) : -1;
+    if (rc == 0) rc = emit_position(fd, x, y);
+    if (rc == 0) rc = emit(fd, EV_SYN, SYN_REPORT, 0);
+    pthread_mutex_unlock(&g_slots_mutex);
+    return rc;
+}
+
+int ui_touch_up_slot(int fd, int slot, float x, float y) {
+    if (fd < 0 || !valid_slot(slot)) return -1;
+    pthread_mutex_lock(&g_slots_mutex);
+    if (!g_slot_active[slot]) {
+        pthread_mutex_unlock(&g_slots_mutex);
+        return -1;
+    }
+    if (emit(fd, EV_ABS, ABS_MT_SLOT, slot) < 0) goto fail;
+    if (emit_position(fd, x, y) < 0) goto fail;
+    if (emit(fd, EV_ABS, ABS_MT_TRACKING_ID, -1) < 0) goto fail;
+    g_slot_active[slot] = 0;
+    if (emit(fd, EV_KEY, BTN_TOUCH, any_slot_active()) < 0) goto fail;
+    if (emit(fd, EV_SYN, SYN_REPORT, 0) < 0) goto fail;
+    pthread_mutex_unlock(&g_slots_mutex);
+    return 0;
+fail:
+    pthread_mutex_unlock(&g_slots_mutex);
+    return -1;
+}
+
+int ui_touch_down(int fd, float x, float y) {
+    return ui_touch_down_slot(fd, 0, x, y);
 }
 
 int ui_touch_move(int fd, float x, float y) {
-    if (fd < 0) return -1;
-    if (emit_position(fd, x, y) < 0) return -1;
-    return emit(fd, EV_SYN, SYN_REPORT, 0);
+    return ui_touch_move_slot(fd, 0, x, y);
 }
 
 int ui_touch_up(int fd, float x, float y) {
-    if (fd < 0) return -1;
-    if (emit_position(fd, x, y) < 0) return -1;
-    if (emit(fd, EV_KEY, BTN_TOUCH, 0) < 0) return -1;
-    if (emit(fd, EV_ABS, ABS_MT_TRACKING_ID, -1) < 0) return -1;
-    return emit(fd, EV_SYN, SYN_REPORT, 0);
+    return ui_touch_up_slot(fd, 0, x, y);
 }

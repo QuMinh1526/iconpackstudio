@@ -10,8 +10,8 @@
  *
  *   RECONFIG                 đọc lại config
  *   TAP <x> <y>              chạm nhanh 40 ms
- *   MACRO <idx> [holdMs]     phát macro idx (holdMs = 0 → giữ đến RELEASE)
- *   HOLD <idx> / RELEASE <idx>
+ *   TRIGGER <idx>            chạy lần lượt target của trigger
+ *   TRIGGER_DOWN/UP <idx>    lặp click trong khi giữ nút
  *   SENS_BEGIN <x> <y>       bắt đầu vệt cảm ứng có áp sensitivity
  *   SENS_MOVE <x> <y>        cập nhật vị trí ngón tay (toạ độ tuyệt đối)
  *   SENS_END
@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -42,6 +43,7 @@
 
 /* Tham chiếu tốc độ cho đường cong accel (px/sample). */
 #define ACCEL_REF_PX 60.0f
+#define MACRO_CLICK_QUEUE_SIZE 16
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -83,6 +85,7 @@ static void logf_msg(const char *fmt, ...) {
 
 typedef struct {
     int active;
+    int in_zone;
     float raw_x, raw_y;
     float out_x, out_y;
     float vel;
@@ -90,7 +93,12 @@ typedef struct {
 
 /* Vùng có được áp sensitivity không (zone 0/3 = toàn màn hình). */
 static int zone_allows(const tc_config *cfg, float x, float y) {
-    if (cfg->has_rect) {
+    if (cfg->zone == 3 && cfg->has_circle) {
+        float dx = x - cfg->circle_x;
+        float dy = y - cfg->circle_y;
+        return dx * dx + dy * dy <= cfg->circle_r * cfg->circle_r;
+    }
+    if (cfg->zone == 3 && cfg->has_rect) {
         return x >= cfg->rect_x1 && x <= cfg->rect_x2 && y >= cfg->rect_y1 && y <= cfg->rect_y2;
     }
     float mid = (float) cfg->screen_w * 0.5f;
@@ -157,16 +165,39 @@ typedef struct {
     tc_config cfg;
     char cfg_path[512];
     int uifd;
-    int held_macro;      /* macro đang giữ (-1 = không) */
     sens_state sens;
 } engine;
 
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    engine *engine;
+    int started;
+    int stopping;
+    int hold_active;
+    int hold_index;
+    int click_queue[MACRO_CLICK_QUEUE_SIZE];
+    int click_head;
+    int click_count;
+    unsigned int generation;
+} macro_runner;
+
+static macro_runner g_macro = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .changed = PTHREAD_COND_INITIALIZER,
+    .hold_index = -1,
+};
+
 static int reload_config(engine *e) {
     char err[256];
+    pthread_mutex_lock(&g_macro.mutex);
     if (tc_load(e->cfg_path, &e->cfg, err, sizeof(err)) != 0) {
+        pthread_mutex_unlock(&g_macro.mutex);
         logf_msg("config: %s", err);
         return -1;
     }
+    pthread_mutex_unlock(&g_macro.mutex);
     logf_msg("config: nạp %s (zone=%d sensi=%.2f/%.2f accel=%d, %d macro, %d drag)",
              e->cfg_path, e->cfg.zone, e->cfg.sensi_x, e->cfg.sensi_y, e->cfg.accel,
              e->cfg.macro_count, e->cfg.drag_count);
@@ -184,19 +215,126 @@ static int do_tap(engine *e, float x, float y, int hold_ms) {
     return ui_touch_up(e->uifd, x, y);
 }
 
-static int do_macro(engine *e, int idx, int hold_ms) {
+static int hold_is_active(macro_runner *runner, int idx, unsigned int generation) {
+    pthread_mutex_lock(&runner->mutex);
+    int active = !runner->stopping && runner->hold_active &&
+        runner->hold_index == idx && runner->generation == generation;
+    pthread_mutex_unlock(&runner->mutex);
+    return active;
+}
+
+static void run_macro_clicks(engine *e, const tc_macro *macro, int repeat,
+                             int idx, unsigned int generation) {
+    for (int i = 0; i < macro->target_count && !g_stop; i++) {
+        if (repeat && !hold_is_active(&g_macro, idx, generation)) break;
+        const tc_target *target = &macro->targets[i];
+        if (ui_touch_down_slot(e->uifd, 1, target->x, target->y) != 0) {
+            logf_msg("macro: không thể chạm target %d", i + 1);
+            return;
+        }
+        sleep_ms(macro->press_ms);
+        if (ui_touch_up_slot(e->uifd, 1, target->x, target->y) != 0) {
+            logf_msg("macro: không thể nhả target %d", i + 1);
+            return;
+        }
+        if (repeat) sleep_ms(macro->hold_delay_ms);
+    }
+}
+
+static void *macro_worker(void *arg) {
+    macro_runner *runner = (macro_runner *) arg;
+    engine *e = runner->engine;
+    for (;;) {
+        pthread_mutex_lock(&runner->mutex);
+        while (!runner->stopping && !runner->hold_active && runner->click_count == 0) {
+            pthread_cond_wait(&runner->changed, &runner->mutex);
+        }
+        if (runner->stopping) {
+            pthread_mutex_unlock(&runner->mutex);
+            break;
+        }
+
+        int idx = runner->hold_active ? runner->hold_index :
+            runner->click_queue[runner->click_head];
+        int is_hold = runner->hold_active;
+        unsigned int generation = runner->generation;
+        if (!is_hold) {
+            runner->click_head = (runner->click_head + 1) % MACRO_CLICK_QUEUE_SIZE;
+            runner->click_count--;
+        }
+        int macro_count = e->cfg.macro_count;
+        tc_macro macro = {0};
+        int valid = idx >= 0 && idx < macro_count;
+        if (valid) macro = e->cfg.macros[idx];
+        pthread_mutex_unlock(&runner->mutex);
+
+        if (valid && macro.target_count > 0) {
+            if (!is_hold && macro.click_delay_ms > 0) sleep_ms(macro.click_delay_ms);
+            run_macro_clicks(e, &macro, is_hold, idx, generation);
+        }
+    }
+    return NULL;
+}
+
+static int start_macro_worker(engine *e) {
+    g_macro.engine = e;
+    if (pthread_create(&g_macro.thread, NULL, macro_worker, &g_macro) != 0) return -1;
+    g_macro.started = 1;
+    return 0;
+}
+
+static void stop_macro_worker(void) {
+    if (!g_macro.started) return;
+    pthread_mutex_lock(&g_macro.mutex);
+    g_macro.stopping = 1;
+    g_macro.hold_active = 0;
+    pthread_cond_broadcast(&g_macro.changed);
+    pthread_mutex_unlock(&g_macro.mutex);
+    pthread_join(g_macro.thread, NULL);
+    g_macro.started = 0;
+}
+
+static int request_macro(engine *e, int idx, int hold) {
+    pthread_mutex_lock(&g_macro.mutex);
     if (idx < 0 || idx >= e->cfg.macro_count) {
-        logf_msg("macro: chỉ số %d ngoài phạm vi (0..%d)", idx, e->cfg.macro_count - 1);
+        int macro_count = e->cfg.macro_count;
+        pthread_mutex_unlock(&g_macro.mutex);
+        logf_msg("macro: chỉ số %d ngoài phạm vi (0..%d)", idx, macro_count - 1);
         return -1;
     }
-    const tc_macro *m = &e->cfg.macros[idx];
-    int dur = hold_ms > 0 ? hold_ms : (m->p0 > 0 ? m->p0 + m->p1 : 0);
-    if (dur == 0) {
-        /* mode 3: giữ cho tới khi app gửi RELEASE. */
-        e->held_macro = idx;
-        return ui_touch_down(e->uifd, m->x1, m->y1);
+    if (e->cfg.macros[idx].mode != (hold ? 1 : 0)) {
+        pthread_mutex_unlock(&g_macro.mutex);
+        logf_msg("macro: trigger %d không khớp chế độ", idx + 1);
+        return -1;
     }
-    return do_tap(e, m->x1, m->y1, dur);
+    if (hold) {
+        g_macro.hold_index = idx;
+        g_macro.hold_active = 1;
+        g_macro.generation++;
+    } else {
+        if (g_macro.click_count == MACRO_CLICK_QUEUE_SIZE) {
+            pthread_mutex_unlock(&g_macro.mutex);
+            logf_msg("macro: hàng đợi click đã đầy");
+            return -1;
+        }
+        int tail = (g_macro.click_head + g_macro.click_count) % MACRO_CLICK_QUEUE_SIZE;
+        g_macro.click_queue[tail] = idx;
+        g_macro.click_count++;
+    }
+    pthread_cond_broadcast(&g_macro.changed);
+    pthread_mutex_unlock(&g_macro.mutex);
+    return 0;
+}
+
+static void release_macro(int idx) {
+    pthread_mutex_lock(&g_macro.mutex);
+    if (g_macro.hold_active && (idx < 0 || g_macro.hold_index == idx)) {
+        g_macro.hold_active = 0;
+        g_macro.hold_index = -1;
+        g_macro.generation++;
+        pthread_cond_broadcast(&g_macro.changed);
+    }
+    pthread_mutex_unlock(&g_macro.mutex);
 }
 
 static int do_drag(engine *e, int idx, float dx, float dy) {
@@ -273,34 +411,31 @@ static int run_command(engine *e, char *line) {
         return -1;
     }
     if (strcmp(verb, "MACRO") == 0) {
-        int idx = 0, hold = 0;
-        int n = sscanf(line, "%*s %d %d", &idx, &hold);
-        if (n >= 1) {
-            return do_macro(e, idx, n == 2 ? hold : 0);
-        }
-        return -1;
+        int idx = -1;
+        if (sscanf(line, "%*s %d", &idx) != 1 || idx < 0 || idx >= e->cfg.macro_count) return -1;
+        return request_macro(e, idx, e->cfg.macros[idx].mode == 1);
     }
-    if (strcmp(verb, "HOLD") == 0) {
-        int idx = 0;
-        if (sscanf(line, "%*s %d", &idx) == 1 && idx >= 0 && idx < e->cfg.macro_count) {
-            const tc_macro *m = &e->cfg.macros[idx];
-            e->held_macro = idx;
-            return ui_touch_down(e->uifd, m->x1, m->y1);
-        }
-        return -1;
+    if (strcmp(verb, "TRIGGER") == 0) {
+        int idx = -1;
+        if (sscanf(line, "%*s %d", &idx) != 1 || idx < 0 || idx >= e->cfg.macro_count) return -1;
+        return request_macro(e, idx, 0);
+    }
+    if (strcmp(verb, "TRIGGER_DOWN") == 0 || strcmp(verb, "HOLD") == 0) {
+        int idx = -1;
+        if (sscanf(line, "%*s %d", &idx) != 1) return -1;
+        return request_macro(e, idx, 1);
+    }
+    if (strcmp(verb, "TRIGGER_UP") == 0) {
+        int idx = -1;
+        if (sscanf(line, "%*s %d", &idx) != 1) return -1;
+        release_macro(idx);
+        return 0;
     }
     if (strcmp(verb, "RELEASE") == 0) {
         int idx = -1;
         sscanf(line, "%*s %d", &idx);
-        if (idx < 0) {
-            idx = e->held_macro;
-        }
-        e->held_macro = -1;
-        if (idx >= 0 && idx < e->cfg.macro_count) {
-            const tc_macro *m = &e->cfg.macros[idx];
-            return ui_touch_up(e->uifd, m->x1, m->y1);
-        }
-        return -1;
+        release_macro(idx);
+        return 0;
     }
     if (strcmp(verb, "DRAG") == 0) {
         int idx = 0;
@@ -315,7 +450,8 @@ static int run_command(engine *e, char *line) {
         if (sscanf(line, "%*s %f %f", &x, &y) != 2) {
             return -1;
         }
-        e->sens.active = zone_allows(&e->cfg, x, y);
+        e->sens.active = 1;
+        e->sens.in_zone = zone_allows(&e->cfg, x, y);
         e->sens.raw_x = x;
         e->sens.raw_y = y;
         e->sens.out_x = x;
@@ -329,13 +465,24 @@ static int run_command(engine *e, char *line) {
             return -1;
         }
         float ox = x, oy = y;
-        sens_apply(&e->cfg, &e->sens, x, y, &ox, &oy);
+        int in_zone = zone_allows(&e->cfg, x, y);
+        if (in_zone && e->sens.in_zone) {
+            sens_apply(&e->cfg, &e->sens, x, y, &ox, &oy);
+        } else {
+            e->sens.raw_x = x;
+            e->sens.raw_y = y;
+            e->sens.out_x = x;
+            e->sens.out_y = y;
+            e->sens.vel = 0.0f;
+        }
+        e->sens.in_zone = in_zone;
         return ui_touch_move(e->uifd, ox, oy);
     }
     if (strcmp(verb, "SENS_END") == 0) {
         float ox = e->sens.out_x;
         float oy = e->sens.out_y;
         e->sens.active = 0;
+        e->sens.in_zone = 0;
         return ui_touch_up(e->uifd, ox, oy);
     }
 
@@ -448,8 +595,8 @@ static int dry_run(const engine *e) {
     printf("\n== macro ==\n");
     for (int i = 0; i < e->cfg.macro_count; i++) {
         const tc_macro *m = &e->cfg.macros[i];
-        printf("  macro %d: tap tại (%.1f,%.1f) giữ %d ms\n", i, m->x1, m->y1,
-               m->p0 > 0 ? m->p0 + m->p1 : 0);
+        printf("  trigger %d: mode=%d, %d target, press=%d ms\n",
+               i, m->mode, m->target_count, m->press_ms);
     }
     return 0;
 }
@@ -504,7 +651,6 @@ int main(int argc, char **argv) {
     engine e;
     memset(&e, 0, sizeof(e));
     e.uifd = -1;
-    e.held_macro = -1;
     snprintf(e.cfg_path, sizeof(e.cfg_path), "%s", cfg_path);
 
     if (reload_config(&e) != 0) {
@@ -530,6 +676,12 @@ int main(int argc, char **argv) {
                  -e.uifd);
         if (g_log != NULL) fclose(g_log);
         return 2;
+    }
+    if (start_macro_worker(&e) != 0) {
+        logf_msg("macro: không khởi động được worker");
+        ui_close_virtual(e.uifd);
+        if (g_log != NULL) fclose(g_log);
+        return 5;
     }
     logf_msg("engine: sẵn sàng (uinput fd=%d, %dx%d)", e.uifd, e.cfg.screen_w, e.cfg.screen_h);
 
@@ -580,10 +732,7 @@ int main(int argc, char **argv) {
     }
 
     logf_msg("engine: dừng");
-    if (e.held_macro >= 0) {
-        const tc_macro *m = &e.cfg.macros[e.held_macro];
-        ui_touch_up(e.uifd, m->x1, m->y1);
-    }
+    stop_macro_worker();
     cmd_close(&w);
     ui_close_virtual(e.uifd);
     if (g_log != NULL) {

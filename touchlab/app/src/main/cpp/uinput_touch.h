@@ -17,4 +17,9 @@ int ui_touch_down(int fd, float x, float y);
 int ui_touch_move(int fd, float x, float y);
 int ui_touch_up(int fd, float x, float y);
 
+/* Macro targets use their own slot so they do not cancel the user's Sensi touch. */
+int ui_touch_down_slot(int fd, int slot, float x, float y);
+int ui_touch_move_slot(int fd, int slot, float x, float y);
+int ui_touch_up_slot(int fd, int slot, float x, float y);
+
 #endif /* TOUCHLAB_UINPUT_TOUCH_H */

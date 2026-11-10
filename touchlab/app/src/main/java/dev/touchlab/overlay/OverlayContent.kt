@@ -55,29 +55,33 @@ import dev.touchlab.config.TouchConfigManager
 import dev.touchlab.model.AppState
 import dev.touchlab.model.DragKind
 import dev.touchlab.model.MacroMode
-import dev.touchlab.model.ZonePreset
 import dev.touchlab.ui.LabeledSlider
+import dev.touchlab.ui.MacroSettings
 import dev.touchlab.ui.SectionTitle
+import dev.touchlab.ui.SensiSettings
 import dev.touchlab.ui.SwitchRow
-import dev.touchlab.ui.ZonePicker
 
 /* ------------------------------------------------------------------ nút trên overlay */
 
 /**
  * Nút macro hình tròn. Kéo để di chuyển (cửa sổ overlay đi theo), chạm để bắn macro.
  *
- * @param holdActive macro mode 3 đang ở trạng thái giữ
+ * @param holdActive trigger Hold đang được nhấn
  */
 @Composable
 fun MacroButtonContent(
     index: Int,
     size: Int,
     mode: Int,
+    locked: Boolean,
     holdActive: Boolean,
+    onPress: () -> Unit,
+    onRelease: () -> Unit,
     onTap: () -> Unit,
     onDrag: (Float, Float) -> Unit,
     onDragEnd: () -> Unit,
 ) {
+    var pressed by remember(index) { mutableStateOf(holdActive) }
     val accent = when (index) {
         0 -> Color(0xFF4FC3F7)
         1 -> Color(0xFFFFB74D)
@@ -89,18 +93,33 @@ fun MacroButtonContent(
         Modifier
             .size(with(androidx.compose.ui.platform.LocalDensity.current) { size.toDp() })
             .clip(CircleShape)
-            .background(if (holdActive) accent else accent.copy(alpha = 0.45f))
-            .pointerInput(index) {
-                detectDragGestures(
-                    onDragEnd = onDragEnd,
-                    onDragCancel = onDragEnd,
-                ) { change, amount ->
-                    change.consume()
-                    onDrag(amount.x, amount.y)
+            .background(if (pressed) accent else accent.copy(alpha = 0.45f))
+            .pointerInput(index, locked) {
+                if (!locked) {
+                    detectDragGestures(
+                        onDragEnd = onDragEnd,
+                        onDragCancel = onDragEnd,
+                    ) { change, amount ->
+                        change.consume()
+                        onDrag(amount.x, amount.y)
+                    }
                 }
             }
-            .pointerInput(index, holdActive) {
-                detectTapGestures(onTap = { onTap() })
+            .pointerInput(index, mode) {
+                detectTapGestures(
+                    onPress = {
+                        if (mode == MacroMode.HOLD) {
+                            pressed = true
+                            onPress()
+                        }
+                        val released = tryAwaitRelease()
+                        if (mode == MacroMode.HOLD) {
+                            pressed = false
+                            onRelease()
+                        }
+                        else if (released) onTap()
+                    },
+                )
             },
         contentAlignment = Alignment.Center,
     ) {
@@ -110,6 +129,71 @@ fun MacroButtonContent(
             fontWeight = FontWeight.Bold,
             fontSize = 16.sp,
         )
+    }
+}
+
+@Composable
+fun MacroTargetContent(
+    index: Int,
+    size: Int,
+    locked: Boolean,
+    onDrag: (Float, Float) -> Unit,
+    onDragEnd: () -> Unit,
+) {
+    Box(
+        Modifier
+            .size(with(androidx.compose.ui.platform.LocalDensity.current) { size.toDp() })
+            .clip(CircleShape)
+            .background(Color(0x8856D6C9))
+            .pointerInput(index, locked) {
+                if (!locked) {
+                    detectDragGestures(
+                        onDragEnd = onDragEnd,
+                        onDragCancel = onDragEnd,
+                    ) { change, amount ->
+                        change.consume()
+                        onDrag(amount.x, amount.y)
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text("${index + 1}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+    }
+}
+
+@Composable
+fun SensiCircleContent(
+    diameter: Int,
+    alpha: Int,
+    locked: Boolean,
+    onDrag: (Float, Float) -> Unit,
+    onDragEnd: () -> Unit,
+) {
+    Box(
+        Modifier
+            .size(with(androidx.compose.ui.platform.LocalDensity.current) { diameter.toDp() })
+            .clip(CircleShape)
+            .background(Color(0xFF4FC3F7).copy(alpha = alpha.coerceIn(0, 100) / 100f))
+            .pointerInput(locked) {
+                if (!locked) {
+                    detectDragGestures(
+                        onDragEnd = onDragEnd,
+                        onDragCancel = onDragEnd,
+                    ) { change, amount ->
+                        change.consume()
+                        onDrag(amount.x, amount.y)
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawCircle(
+                Color(0xFF4FC3F7).copy(alpha = alpha.coerceIn(0, 100) / 100f),
+                style = Stroke(width = 2.dp.toPx()),
+            )
+        }
     }
 }
 
@@ -173,11 +257,12 @@ fun SensiTouchLayer(
 @Composable
 fun OverlayPanelContent(
     state: AppState,
+    screenW: Int,
+    screenH: Int,
     engineOk: Boolean,
     engineMessage: String?,
     onEdit: () -> Unit,
     onApply: () -> Unit,
-    onPickZone: (String, RectF?, (RectF) -> Unit) -> Unit,
     onAddMacro: () -> Unit,
     onRemoveMacro: (Int) -> Unit,
     onRestartEngine: () -> Unit,
@@ -237,124 +322,30 @@ fun OverlayPanelContent(
                 }
 
                 Column(Modifier.weight(1f).verticalScroll(scroll)) {
-                    SectionTitle("Macro ($macroCount/${TouchConfigManager.MAX_MACROS})")
-                    state.macros.forEachIndexed { index, macro ->
-                        Card(
-                            Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1F2630)),
-                        ) {
-                            Column(Modifier.padding(12.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        "Nút ${index + 1}",
-                                        color = Color.White,
-                                        fontWeight = FontWeight.Medium,
-                                    )
-                                    Spacer(Modifier.weight(1f))
-                                    Switch(
-                                        checked = macro.enabled,
-                                        onCheckedChange = {
-                                            macro.enabled = it
-                                            changed()
-                                        },
-                                    )
-                                    TextButton(onClick = {
-                                        onRemoveMacro(index)
-                                        tick++
-                                    }) { Text("Xoá", color = Color(0xFFE57373)) }
-                                }
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    MacroMode.LABELS.forEachIndexed { m, label ->
-                                        FilterChip(
-                                            selected = macro.mode == m,
-                                            onClick = {
-                                                macro.mode = m
-                                                changed()
-                                            },
-                                            label = { Text(label, fontSize = 11.sp) },
-                                        )
-                                    }
-                                }
-                                LabeledSlider(
-                                    label = "Kích thước: ${macro.size}px",
-                                    value = macro.size.toFloat(),
-                                    range = TouchConfigManager.SIZE_MIN.toFloat()..TouchConfigManager.SIZE_MAX.toFloat(),
-                                ) {
-                                    macro.size = it.toInt()
-                                    changed()
-                                }
-                                ZonePicker(
-                                    current = macro.zone,
-                                    onPick = { z ->
-                                        macro.zone = z
-                                        changed()
-                                    },
-                                    onCustom = {
-                                        onPickZone("Vùng của nút macro", macro.customRect) { r ->
-                                            macro.customRect = r
-                                            macro.zone = ZonePreset.CUSTOM
-                                            tick++
-                                            onEdit()
-                                        }
-                                    },
-                                )
-                            }
-                        }
-                    }
-                    OutlinedButton(onClick = { onAddMacro(); tick++ }) { Text("+ Thêm macro") }
-
-                    SectionTitle("Sensitivity")
+                    SectionTitle("Macro · $macroCount/${TouchConfigManager.MAX_MACROS}")
                     Card(
                         Modifier.fillMaxWidth().padding(vertical = 4.dp),
                         colors = CardDefaults.cardColors(containerColor = Color(0xFF1F2630)),
                     ) {
                         Column(Modifier.padding(12.dp)) {
-                            SwitchRow("Bật sensitivity (bơm lại touch)", state.sensi.enabled) {
-                                state.sensi.enabled = it
-                                changed()
-                            }
-                            SwitchRow("Accel phi tuyến", state.sensi.accel) {
-                                state.sensi.accel = it
-                                changed()
-                            }
-                            ZonePicker(
-                                current = state.sensi.zone,
-                                onPick = { z ->
-                                    state.sensi.zone = z
-                                    changed()
-                                },
-                                onCustom = {
-                                    onPickZone("Vùng sensitivity", state.sensi.customRect) { r ->
-                                        state.sensi.customRect = r
-                                        state.sensi.zone = ZonePreset.CUSTOM
-                                        tick++
-                                        onEdit()
-                                    }
-                                },
+                            MacroSettings(
+                                state = state,
+                                screenW = screenW,
+                                screenH = screenH,
+                                onChanged = changed,
+                                onAddMacro = { onAddMacro(); tick++ },
+                                onRemoveMacro = { onRemoveMacro(it); tick++ },
                             )
-                            val zoneIndex = state.sensi.zoneIndex()
-                            LabeledSlider(
-                                label = "Hệ số X (${state.sensi.zone.label}): ${fmt2(state.sensi.sx[zoneIndex])}",
-                                value = state.sensi.sx[zoneIndex],
-                                range = TouchConfigManager.SENSI_MIN..TouchConfigManager.SENSI_MAX,
-                            ) {
-                                state.sensi.sx[zoneIndex] = it
-                                changed()
-                            }
-                            LabeledSlider(
-                                label = "Hệ số Y: ${fmt2(state.sensi.sy[zoneIndex])}",
-                                value = state.sensi.sy[zoneIndex],
-                                range = TouchConfigManager.SENSI_MIN..TouchConfigManager.SENSI_MAX,
-                            ) {
-                                state.sensi.sy[zoneIndex] = it
-                                changed()
-                            }
-                            Text(
-                                "Lưu ý: bật sensitivity sẽ chặn touch trực tiếp của game; " +
-                                    "engine nhận và bơm lại touch đã scale.",
-                                color = Color(0xFF9E9E9E),
-                                fontSize = 11.sp,
-                            )
+                        }
+                    }
+
+                    SectionTitle("Sensi · độc lập với Macro")
+                    Card(
+                        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1F2630)),
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            SensiSettings(state.sensi, screenW, screenH, changed)
                         }
                     }
 

@@ -169,7 +169,6 @@ fun MacroScreen(
     screenW: Int,
     screenH: Int,
     onEdit: () -> Unit,
-    onPickZone: (String, RectF?, (RectF) -> Unit) -> Unit,
 ) {
     Column(
         Modifier
@@ -179,170 +178,33 @@ fun MacroScreen(
     ) {
         Text("Macro", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         Text(
-            "Kéo nút trong khung xem trước để đổi vị trí. Nút trên overlay cũng kéo được trực tiếp.",
+            "Mỗi trigger chạy target click theo thứ tự. Có thể chỉnh vị trí tại đây hoặc ngay trên overlay TL.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
         )
-        Spacer(Modifier.height(10.dp))
-        ScreenPreview(state, screenW, screenH, onEdit)
-
-        state.macros.forEachIndexed { index, macro ->
-            Card(
-                Modifier.fillMaxWidth().padding(top = 10.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-            ) {
-                Column(Modifier.padding(12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Nút ${index + 1}", fontWeight = FontWeight.Medium)
-                        Spacer(Modifier.weight(1f))
-                        Switch(checked = macro.enabled, onCheckedChange = {
-                            macro.enabled = it
-                            onEdit()
-                        })
-                        TextButton(onClick = {
-                            state.macros.removeAt(index)
-                            onEdit()
-                        }) { Text("Xoá", color = MaterialTheme.colorScheme.error) }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        MacroMode.LABELS.forEachIndexed { mode, label ->
-                            FilterChip(
-                                selected = macro.mode == mode,
-                                onClick = {
-                                    macro.mode = mode
-                                    onEdit()
-                                },
-                                label = { Text(label, fontSize = 10.sp) },
-                            )
-                        }
-                    }
-                    LabeledSlider(
-                        label = "Kích thước: ${macro.size}px",
-                        value = macro.size.toFloat(),
-                        range = TouchConfigManager.SIZE_MIN.toFloat()..TouchConfigManager.SIZE_MAX.toFloat(),
-                    ) {
-                        macro.size = it.toInt()
-                        onEdit()
-                    }
-                    ZonePicker(current = macro.zone, onPick = {
-                        macro.zone = it
-                        onEdit()
-                    }, onCustom = {
-                        onPickZone("Vùng của nút macro", macro.customRect) { r ->
-                            macro.customRect = r
-                            macro.zone = ZonePreset.CUSTOM
-                            onEdit()
-                        }
-                    })
-                    Text(
-                        "Vị trí: ${macro.x.toInt()}, ${macro.y.toInt()}  •  trigger: ${macro.x2.toInt()}, ${macro.y2.toInt()}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                    )
-                }
-            }
-        }
-
-        if (state.macros.size < TouchConfigManager.MAX_MACROS) {
-            OutlinedButton(
-                onClick = {
-                    state.macros.add(
-                        dev.touchlab.model.MacroModel(
-                            x = screenW * 0.7f,
-                            y = screenH * 0.5f,
-                            x2 = screenW * 0.7f,
-                            y2 = screenH * 0.42f,
-                        )
-                    )
-                    onEdit()
-                },
-                modifier = Modifier.padding(top = 10.dp),
-            ) { Text("+ Thêm macro") }
-        }
-    }
-}
-
-/** Khung xem trước tỉ lệ màn hình, kéo nút để đổi vị trí. */
-@Composable
-private fun ScreenPreview(state: AppState, screenW: Int, screenH: Int, onEdit: () -> Unit) {
-    var selected by remember { mutableIntStateOf(-1) }
-    var dragTick by remember { mutableIntStateOf(0) }
-    val aspect = if (screenH > 0) screenW.toFloat() / screenH else 0.46f
-
-    BoxWithConstraints(
-        Modifier
-            .fillMaxWidth()
-            .aspectRatio(aspect)
-            .clip(RoundedCornerShape(10.dp))
-            .background(Color(0xFF0A0E13))
-            .border(1.dp, Color(0xFF2A3542), RoundedCornerShape(10.dp)),
-    ) {
-        val density = LocalDensity.current
-        val widthPx = with(density) { constraints.maxWidth.toFloat() }
-        val scale = if (screenW > 0) widthPx / screenW else 1f
-
-        val zoneRect = state.sensi.zone.rectOf(screenW, screenH, state.sensi.customRect)
-        Box(
-            Modifier
-                .offset { IntOffset((zoneRect.left * scale).toInt(), (zoneRect.top * scale).toInt()) }
-                .size(
-                    with(density) { (zoneRect.width() * scale).toDp() },
-                    with(density) { (zoneRect.height() * scale).toDp() },
-                )
-                .border(1.dp, Color(0x664FC3F7)),
-        )
-
-        // key(dragTick): vẽ lại các nút sau mỗi bước kéo.
-        key(dragTick) {
-            state.macros.forEachIndexed { index, macro ->
-                val d = with(density) { (macro.size * scale).toDp() }
-                Box(
-                    Modifier
-                        .offset {
-                            IntOffset(
-                                ((macro.x - macro.size / 2f) * scale).toInt(),
-                                ((macro.y - macro.size / 2f) * scale).toInt(),
-                            )
-                        }
-                        .size(d)
-                        .clip(CircleShape)
-                        .background(
-                            if (index == selected) Color(0xFF4FC3F7)
-                            else Color(0xCC607D8B)
+        MacroSettings(
+            state = state,
+            screenW = screenW,
+            screenH = screenH,
+            onChanged = onEdit,
+            onAddMacro = {
+                state.macros.add(
+                    dev.touchlab.model.MacroModel(
+                        x = screenW * 0.7f,
+                        y = screenH * 0.5f,
+                        targets = mutableListOf(
+                            dev.touchlab.model.MacroTarget(x = screenW * 0.7f, y = screenH * 0.42f)
                         ),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text("${index + 1}", fontSize = 9.sp, color = Color.White)
-                }
-            }
-        }
-
-        Box(
-            Modifier
-                .fillMaxSize()
-                .pointerInput(state.macros.size) {
-                    detectDragGestures(
-                        onDragStart = { off ->
-                            val sx = off.x / scale
-                            val sy = off.y / scale
-                            selected = state.macros.indexOfFirst { m ->
-                                val dx = m.x - sx
-                                val dy = m.y - sy
-                                dx * dx + dy * dy <= (m.size / 2f + 40f) * (m.size / 2f + 40f)
-                            }
-                        },
-                        onDrag = { change, amount ->
-                            change.consume()
-                            state.macros.getOrNull(selected)?.let { m ->
-                                m.x = (m.x + amount.x / scale).coerceIn(0f, screenW.toFloat())
-                                m.y = (m.y + amount.y / scale).coerceIn(0f, screenH.toFloat())
-                                dragTick++
-                            }
-                        },
-                        onDragEnd = { onEdit() },
-                        onDragCancel = { onEdit() },
                     )
+                )
+                onEdit()
+            },
+            onRemoveMacro = {
+                if (it in state.macros.indices) {
+                    state.macros.removeAt(it)
+                    onEdit()
                 }
+            },
         )
     }
 }
@@ -352,8 +214,9 @@ private fun ScreenPreview(state: AppState, screenW: Int, screenH: Int, onEdit: (
 @Composable
 fun SensiScreen(
     state: AppState,
+    screenW: Int,
+    screenH: Int,
     onEdit: () -> Unit,
-    onPickZone: (String, RectF?, (RectF) -> Unit) -> Unit,
 ) {
     Column(
         Modifier
@@ -362,110 +225,16 @@ fun SensiScreen(
             .padding(16.dp),
     ) {
         Text("Sensitivity", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Text(
-            "Hệ số gốc 1.0 – 3.45 (1.0 = không đổi). Accel thêm gain phi tuyến khi kéo nhanh.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
-        )
+        Text("Sensi có overlay và cấu hình độc lập với Macro.", style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(8.dp))
-
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
             Column(Modifier.padding(12.dp)) {
-                SwitchRow("Bật sensitivity", state.sensi.enabled) {
-                    state.sensi.enabled = it
-                    onEdit()
-                }
-                SwitchRow("Accel phi tuyến", state.sensi.accel) {
-                    state.sensi.accel = it
-                    onEdit()
-                }
-                ZonePicker(current = state.sensi.zone, onPick = {
-                    state.sensi.zone = it
-                    onEdit()
-                }, onCustom = {
-                    onPickZone("Vùng sensitivity", state.sensi.customRect) { r ->
-                        state.sensi.customRect = r
-                        state.sensi.zone = ZonePreset.CUSTOM
-                        onEdit()
-                    }
-                })
-            }
-        }
-
-        SectionTitle("Hệ số theo zone")
-        val zoneNames = listOf("Zone 0 (toàn màn hình)", "Zone 1 (trái)", "Zone 2 (phải)", "Zone 3 (custom)")
-        repeat(4) { i ->
-            Card(
-                Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-            ) {
-                Column(Modifier.padding(12.dp)) {
-                    Text(zoneNames[i], fontWeight = FontWeight.Medium, fontSize = 13.sp)
-                    LabeledSlider(
-                        label = "X: ${fmt(state.sensi.sx[i])}",
-                        value = state.sensi.sx[i],
-                        range = TouchConfigManager.SENSI_MIN..TouchConfigManager.SENSI_MAX,
-                    ) {
-                        state.sensi.sx[i] = it
-                        onEdit()
-                    }
-                    LabeledSlider(
-                        label = "Y: ${fmt(state.sensi.sy[i])}",
-                        value = state.sensi.sy[i],
-                        range = TouchConfigManager.SENSI_MIN..TouchConfigManager.SENSI_MAX,
-                    ) {
-                        state.sensi.sy[i] = it
-                        onEdit()
-                    }
-                }
-            }
-        }
-
-        SectionTitle("Drag / Aim")
-        state.drags.forEach { drag ->
-            Card(
-                Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-            ) {
-                Column(Modifier.padding(12.dp)) {
-                    SwitchRow(drag.kind.label, drag.on) {
-                        drag.on = it
-                        onEdit()
-                    }
-                    LabeledSlider(
-                        label = "Lực: ${drag.strength}",
-                        value = drag.strength.toFloat(),
-                        range = 1f..100f,
-                    ) {
-                        drag.strength = it.toInt()
-                        onEdit()
-                    }
-                    LabeledSlider(
-                        label = "Kích thước: ${drag.size}px",
-                        value = drag.size.toFloat(),
-                        range = 40f..300f,
-                    ) {
-                        drag.size = it.toInt()
-                        onEdit()
-                    }
-                    if (drag.kind != DragKind.DRAG) {
-                        LabeledSlider(
-                            label = "Độ trễ: ${drag.delay}ms",
-                            value = drag.delay.toFloat(),
-                            range = 0f..300f,
-                        ) {
-                            drag.delay = it.toInt()
-                            onEdit()
-                        }
-                    }
-                }
+                SensiSettings(state.sensi, screenW, screenH, onEdit)
             }
         }
         Spacer(Modifier.height(20.dp))
     }
 }
-
-private fun fmt(v: Float): String = String.format(java.util.Locale.US, "%.2f", v)
 
 /* ------------------------------------------------------------------ Game Lab */
 

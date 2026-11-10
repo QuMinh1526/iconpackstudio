@@ -8,9 +8,12 @@ import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
+import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
 import dev.touchlab.ui.TouchLabTheme
@@ -34,6 +37,10 @@ class OverlayComposeView(
     init {
         // Overlay bị remove/add liên tục → giải phóng composition khi detach để không rò rỉ.
         setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+        setViewTreeLifecycleOwner(this)
+        setViewTreeViewModelStoreOwner(this)
+        setViewTreeSavedStateRegistryOwner(this)
+        savedStateController.performAttach()
         savedStateController.performRestore(null)
         lifecycleRegistry.currentState = Lifecycle.State.RESUMED
     }
@@ -43,8 +50,8 @@ class OverlayComposeView(
     override val savedStateRegistry: SavedStateRegistry get() = savedStateController.savedStateRegistry
 
     override fun onAttachedToWindow() {
-        super.onAttachedToWindow()
         lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+        super.onAttachedToWindow()
     }
 
     override fun onDetachedFromWindow() {

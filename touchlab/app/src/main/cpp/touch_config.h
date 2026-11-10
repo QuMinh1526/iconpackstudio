@@ -19,16 +19,25 @@
 #include <stddef.h>
 
 #define TC_MAX_MACROS 8
+#define TC_MAX_TARGETS 10
 #define TC_MAX_DRAGS  2
 #define TC_MAX_PERMIT 256
 
-/* Một nút macro trên overlay. */
 typedef struct {
-    float x1, y1;      /* tâm nút (px màn hình) */
-    float r;           /* bán kính nút = size / 2 */
-    float x2, y2;      /* tâm vùng trigger phụ */
-    int mode;          /* 0..3 — chọn bảng thời gian giữ */
-    int p0, p1;        /* p0 = thời gian giữ (ms), p1 = trễ bổ sung trước khi nhả */
+    float x, y;
+    float r;
+} tc_target;
+
+/* Một trigger và tối đa 10 điểm click chạy tuần tự. */
+typedef struct {
+    float x, y;
+    float trigger_r;
+    int mode;          /* 0 = click một lượt, 1 = lặp khi giữ */
+    int hold_delay_ms; /* khoảng nghỉ sau mỗi click trong Hold */
+    int press_ms;
+    int click_delay_ms;
+    int target_count;
+    tc_target targets[TC_MAX_TARGETS];
 } tc_macro;
 
 /* Một điểm drag / stable-aim. */
@@ -45,6 +54,8 @@ typedef struct {
     int accel;                /* bật accel phi tuyến */
     int has_rect;             /* dòng 'Z' (custom zone) có mặt */
     float rect_x1, rect_y1, rect_x2, rect_y2;
+    int has_circle;
+    float circle_x, circle_y, circle_r;
     int rotation;             /* 0..3 */
     int screen_w, screen_h;
     tc_macro macros[TC_MAX_MACROS];
